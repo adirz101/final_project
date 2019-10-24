@@ -1,0 +1,495 @@
+#!/Users/dyrzkryh/PycharmProjects/finalProject2/venv/bin/python
+
+import argparse
+import contextlib
+import logging
+import os
+import re
+import sys
+import shutil
+import subprocess
+import tempfile
+import traceback
+import zipfile
+import concert
+import concert.config
+import concert.session.management as cs
+from concert.helpers import Command
+from concert.ext.cmd import plugins
+
+
+def docstring_summary(doc):
+    if doc and doc.find('.'):
+        return doc[:doc.find('.')]
+    return doc
+
+
+def cmp_versions(v1, v2):
+    """Compare two version numbers and return cmp compatible result"""
+    def normalize(v):
+        return [int(x) for x in re.sub(r'(\.0+)*$', '', v).split(".")]
+
+    n1 = normalize(v1)
+    n2 = normalize(v2)
+    return (n1 > n2) - (n1 < n2)
+
+
+def get_ipython_shell(config=None):
+    import IPython
+    import concert.async
+
+    version = IPython.__version__
+    shell = None
+
+    # Jeez, let's see what comes next ...
+    if cmp_versions(version, '0.11') < 0:
+        from IPython.Shell import IPShellEmbed
+        shell = IPShellEmbed()
+    elif cmp_versions(version, '1.0') < 0:
+        from IPython.frontend.terminal.embed import \
+            InteractiveShellEmbed
+        shell = InteractiveShellEmbed(config=config, banner1='')
+    else:
+        from IPython.terminal.embed import InteractiveShellEmbed
+        shell = InteractiveShellEmbed(config=config, banner1='')
+
+    if concert.config.ENABLE_GEVENT and concert.async.HAVE_GEVENT:
+        if cmp_versions(version, '2.0') >= 0:
+            from IPython.lib.inputhook import inputhook_manager, allow_CTRL_C
+            from concert.ext.gevent import inputhook_gevent
+
+            inputhook_manager.set_inputhook(inputhook_gevent)
+            # This is not the cleanest way because ctrl-c might come outside the try-except
+            # block of the input hook but this seems to be the only solution yet.
+            allow_CTRL_C()
+            inputhook_manager._current_gui = 'gevent'
+        else:
+            print("IPython {} is too old for gevent integration. "
+                  "Please upgrade IPython or disable gevent.".format(version))
+
+    return shell
+
+
+def get_prompt_config(session_name):
+    """Customize the prompt for the *session_name*."""
+    try:
+        from IPython.config.loader import Config
+        cfg = Config()
+        prompt_config = cfg.PromptManager
+        trig = ">"
+        prompt =  '{} {} '.format(session_name, trig)
+        prompt_config.in_template = '{color.Normal}' + prompt
+        prompt_config.in2_template = '   .\\D. {} '.format(trig)
+        prompt_config.out_template = '\r'.format(trig)
+        return cfg
+    except:
+        pass
+
+
+class InitCommand(Command):
+
+    """Create a new session."""
+
+    def __init__(self):
+        opts = {'session': {'type': str},
+                '--force': {'action': 'store_true',
+                            'help': "Overwrite existing sessions"},
+                '--imports': {'help': "Pre-import processes",
+                              'metavar': 'modules',
+                              'default': ''}}
+        super(InitCommand, self).__init__('init', opts)
+
+    def run(self, session=None, imports="", force=False):
+        if cs.exists(session) and not force:
+            message = "Session `{0}' already exists."
+            message += " Use --force to create it anyway."
+            print(message.format(session))
+        else:
+            cs.create(session, imports.split())
+
+
+class EditCommand(Command):
+
+    """Edit a session."""
+
+    def __init__(self):
+        opts = {'session': {'type': str}}
+        super(EditCommand, self).__init__('edit', opts)
+
+    def run(self, session=None):
+        if not cs.exists(session):
+            print("Session not found, creating {}.".format(session))
+            InitCommand().run(session)
+
+        env = os.environ
+        editor = env['EDITOR'] if 'EDITOR' in env else 'vi'
+        subprocess.call([editor, cs.path(session)])
+
+
+class LogCommand(Command):
+
+    """Show session logs."""
+
+    def __init__(self):
+        opts = {'session': {'type': str,
+                            'nargs': '?'},
+                '--follow': {'action': 'store_true',
+                             'help': 'Show current log'}}
+        super(LogCommand, self).__init__('log', opts)
+
+    def run(self, session=None, follow=False):
+        logfile = cs.logfile_path()
+
+        if not os.path.exists(logfile):
+            return
+
+        # This is danger zone here because we run subprocess.call with
+        # shell=True.  However, the only input that we input is args.session
+        # which we check first and the logfile itself.
+
+        if session:
+            cs.exit_if_not_exists(session)
+
+            if follow:
+                cmd = 'tail -f {} | grep --line-buffered "{}:"'.format(logfile, session)
+            else:
+                cmd = 'grep "{0}:" {1} | less'.format(session, logfile)
+        else:
+            if follow:
+                cmd = 'tail -f {}'.format(logfile)
+            else:
+                cmd = 'less {}'.format(logfile)
+
+        try:
+            subprocess.call(cmd, shell=True)
+        except KeyboardInterrupt:
+            # When following we can only leave tail by C-c, hence to avoid
+            # spamming the terminal with a stack trace we just ignore the
+            # Keyboardinterrupt exception.
+            pass
+
+
+class ShowCommand(Command):
+
+    """Show available sessions or details of a given *session*."""
+
+    def __init__(self):
+        opts = {'session': {'type': str,
+                            'nargs': '?',
+                            'default': None,
+                            'help': "Show details"}}
+        super(ShowCommand, self).__init__('show', opts)
+
+    def run(self, session=None):
+        if session:
+            try:
+                module = cs.load(session)
+                print(module.__doc__)
+            except IOError:
+                print("Cannot find {0}".format(session))
+            except ImportError as exception:
+                print("Cannot import {0}: {1}".format(session, exception))
+        else:
+            sessions = cs.get_existing()
+            print("Available sessions:")
+
+            for session in sessions:
+                print("  %s" % session)
+
+
+class MoveCommand(Command):
+
+    """Move session *source* to *target*."""
+
+    def __init__(self):
+        opts = {'source': {'type': str,
+                           'help': "Name of the source session"},
+                'target': {'type': str,
+                           'help': "Name of the target session"}}
+        super(MoveCommand, self).__init__('mv', opts)
+
+    def run(self, source, target):
+        if not cs.exists(source):
+            sys.exit("`{}' does not exist".format(source))
+
+        if cs.exists(target):
+            sys.exit("`{}' already exists".format(target))
+
+        cs.move(source, target)
+        print("Renamed {} -> {}".format(source, target))
+
+
+class CopyCommand(Command):
+
+    """Copy session *source* to *target*."""
+
+    def __init__(self):
+        opts = {'source': {'type': str,
+                           'help': "Name of the source session"},
+                'target': {'type': str,
+                           'help': "Name of the target session"}}
+        super(CopyCommand, self).__init__('cp', opts)
+
+    def run(self, source, target):
+        if not cs.exists(source):
+            sys.exit("`{}' does not exist".format(source))
+
+        if cs.exists(target):
+            sys.exit("`{}' already exists".format(target))
+
+        cs.copy(source, target)
+        print("Copied {} -> {}".format(source, target))
+
+
+class RemoveCommand(Command):
+
+    """Remove one or more sessions."""
+
+    def __init__(self):
+        opts = {'sessions': {'type': str,
+                             'nargs': '+',
+                             'metavar': 'session'}}
+        super(RemoveCommand, self).__init__('rm', opts)
+
+    def run(self, sessions=[]):
+        for session in sessions:
+            print("Removing {0}...".format(session))
+            cs.remove(session)
+
+
+class ImportCommand(Command):
+
+    """Import an existing *session*."""
+
+    def __init__(self):
+        opts = {'url': {'nargs': '+', 'type': str,
+                        'help': "Import a Python module and save as a session."
+                        " Note: Server certificates of HTTPS requests"
+                        " are NOT verified!"},
+                '--force': {'action': 'store_true',
+                            'help': "Overwrite existing sessions"},
+                '--repo': {'action': 'store_true',
+                           'help':
+                           "Checkout Git repository and import all files"}}
+        super(ImportCommand, self).__init__('import', opts)
+
+    def run(self, url, force=False, repo=False):
+        for u in url:
+            if repo:
+                self._import_repo(u, force)
+            else:
+                self._import_file(u, force)
+
+    def _import_repo(self, url, force):
+        path = tempfile.mkdtemp()
+        cmd = 'git clone --quiet {0} {1}'.format(url, path)
+        proc = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+
+        if proc.returncode != 0:
+            sys.exit("Could not clone {0}.".format(url))
+
+        for filename in (x for x in os.listdir(path) if x.endswith('.py')):
+            session_name = os.path.basename(filename[:-3])
+
+            if cs.exists(session_name) and not force:
+                print("`{0}' already exists (use --force to install"
+                      " anyway)".format(session_name))
+            else:
+                print("Add session {0} ...".format(filename[:-3]))
+                shutil.copy(os.path.join(path, filename),
+                            cs.path())
+
+        shutil.rmtree(path)
+
+    def _import_file(self, url, force):
+        import urllib2
+
+        if not url.endswith('.py'):
+            sys.exit("`{0}' is not a Python module".format(url))
+
+        session_name = os.path.basename(url[:-3])
+
+        if cs.exists(session_name) and not force:
+            sys.exit("`{0}' already exists".format(session_name))
+
+        print("Add session {0} ...".format(session_name))
+        local_url = self._get_url(url)
+
+        with contextlib.closing(urllib2.urlopen(local_url)) as data:
+            with open(cs.path(session_name), 'w') as output:
+                output.write(data.read())
+
+    def _get_url(self, path_or_url):
+        import urlparse
+
+        result = urlparse.urlsplit(path_or_url)
+
+        if result.scheme:
+            return path_or_url
+
+        if not os.path.exists(path_or_url):
+            sys.exit("Cannot find module `{0}'.".format(path_or_url))
+
+        result = ('file', '', os.path.abspath(path_or_url), '', '')
+        return urlparse.urlunsplit(result)
+
+
+class ExportCommand(Command):
+
+    """Export all sessions as a Zip archive."""
+
+    def __init__(self):
+        opts = {'name': {'type': str,
+                         'help': "Name of the archive"}}
+        super(ExportCommand, self).__init__('export', opts)
+
+    def run(self, name):
+        name = name if name.endswith('.zip') else name + '.zip'
+
+        with zipfile.ZipFile(name, 'w') as archive:
+            for path in (cs.path(session) for session in cs.get_existing()):
+                archive.writestr(os.path.basename(path), open(path).read())
+
+
+class StartCommand(Command):
+
+    """Start a session."""
+
+    def __init__(self):
+        opts = {'session': {'nargs': '?', 'type': str, 'default': None},
+                '--filename':  {'type': str, 'default': None},
+                '--logto': {'choices': ['stderr', 'file'],
+                            'default': 'file'},
+                '--logfile': {'type': str},
+                '--loglevel': {'choices': ['debug', 'info', 'warning', 'error',
+                                           'critical'],
+                               'default': 'info'},
+                '--non-interactive': {'action': 'store_true'}}
+        super(StartCommand, self).__init__('start', opts)
+
+    def run(self, session=None, filename=None,
+            non_interactive=False,
+            logto='file', logfile=None, loglevel=None):
+        if session:
+            cs.exit_if_not_exists(session)
+
+        if logto == 'file':
+            logfilename = logfile if logfile else cs.logfile_path()
+            handler = logging.FileHandler(logfilename)
+        else:
+            handler = logging.StreamHandler(sys.stderr)
+
+        numeric_level = getattr(logging, loglevel.upper())
+
+        handler.setLevel(numeric_level)
+        logformat = '[%(asctime)s] %(levelname)s: %(name)s: {}: %(message)s'
+        formatter = logging.Formatter(logformat.format(session))
+        handler.setFormatter(formatter)
+
+        self.logger = logging.getLogger()
+        self.logger.addHandler(handler)
+        self.logger.setLevel(numeric_level)
+
+        # Add session path, so that sessions can import other sessions
+        sys.path.append(cs.path())
+
+        if non_interactive:
+            if session:
+                execfile(cs.path(session), globals())
+        else:
+            try:
+                if filename:
+                    module = cs.load(filename, from_file=True)
+                else:
+                    module = cs.load(session) if session else None
+            except:
+                traceback.print_exc()
+                sys.exit(1)
+
+            self.run_shell(module)
+
+    def run_shell(self, module=None):
+        from concert.base import (UnitError, LimitError, ParameterError,
+                                  ReadAccessError, WriteAccessError, LockError)
+
+        def _handler(_shell, _etype, evalue, _traceback_, tb_offset=None):
+            print("Sorry, {0}".format(str(evalue)))
+            return None
+
+        print("Welcome to Concert {0}".format(concert.__version__))
+
+        if module:
+            print(module.__doc__)
+
+        attrs = [attr for attr in dir(module) if not attr.startswith('_')]
+        mvars = dict((attr, getattr(module, attr)) for attr in attrs)
+        globals().update(mvars)
+
+        try:
+            exceptions = (UnitError, LimitError, ParameterError,
+                          ReadAccessError, WriteAccessError, LockError)
+
+            config = get_prompt_config(module.__name__) if module else get_prompt_config('concert')
+
+            if not module:
+                from concert.quantities import q
+
+            try:
+                shell = get_ipython_shell(config=config)
+            except AttributeError:
+                template = config.PromptManager.in_template.replace('Normal', 'normal')
+                config.PromptManager.in_template = template
+                shell = get_ipython_shell(config=config)
+
+            shell.set_custom_exc(exceptions, _handler)
+            shell()
+        except ImportError as exception:
+            msg = "You must install IPython to run the Concert shell: {0}"
+            print(msg.format(exception))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--version',
+                        action='version',
+                        version="Concert v%s " % concert.__version__)
+
+    subparsers = parser.add_subparsers(title="Concert commands",
+                                       metavar="")
+
+    commands = [InitCommand(),
+                EditCommand(),
+                LogCommand(),
+                ShowCommand(),
+                MoveCommand(),
+                CopyCommand(),
+                RemoveCommand(),
+                ImportCommand(),
+                ExportCommand(),
+                StartCommand()]
+
+    commands.extend(plugins)
+
+    for command in commands:
+        summary = docstring_summary(command.__doc__)
+        cmd_parser = subparsers.add_parser(command.name, help=summary)
+        cmd_parser.set_defaults(func=command.run)
+
+        for arg in command.opts.keys():
+            cmd_parser.add_argument(arg, **command.opts[arg])
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+    func = args.func
+    del args.func
+    func(**vars(args))
+
+
+if __name__ == '__main__':
+    main()
