@@ -1,7 +1,7 @@
 import xlrd
 import Classes
 import copy
-
+import xlwt
 
 def ret_courses_from_sheet_one():
     result_data = []
@@ -85,3 +85,29 @@ def ret_total_hours(Course):
     for i in Course:
         total = total + i.hoursPerWeek
     return total
+
+def createExelTableForStudents(Curses, Teacher, solotion):
+    fileName = 'Schedule_Students.xls'
+    excel_file = xlwt.Workbook()
+    sheet1 = excel_file.add_sheet('first year')
+    sheet2 = excel_file.add_sheet('second year')
+    sheet3 = excel_file.add_sheet('third year')
+    for i in solotion:
+        if(Curses[i[2]].year == 1):
+            sheet1.write(i[1]%10,int(i[1]/10),Teacher[i[0]].name + " : " + Curses[i[2]].name)
+        elif(Curses[i[2]].year == 2):
+            sheet2.write(i[1] % 10, int(i[1] / 10), Teacher[i[0]].name + " : " + Curses[i[2]].name)
+        else:
+            sheet3.write(i[1] % 10, int(i[1] / 10), Teacher[i[0]].name + " : " + Curses[i[2]].name)
+
+    excel_file.save(fileName)
+
+def createExelTableForteachers(Curses, Teacher, solotion):
+    fileName = 'Schedule_Teachers.xls'
+    sheetsArray = []
+    excel_file = xlwt.Workbook()
+    for i in Teacher:
+        sheetsArray.append(excel_file.add_sheet(i.name))
+    for s in solotion:
+        sheetsArray[s[0]].write(s[1]%10, int(s[1]/10), Curses[s[2]].name)
+    excel_file.save(fileName)

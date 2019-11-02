@@ -1,5 +1,6 @@
 import Keywords
 from docplex.mp.model import Model
+
 from decimal import Decimal
 
 Courses = Keywords.ret_courses_from_sheet_one()
@@ -26,6 +27,14 @@ for j in range(50):
     mdl.add_constraint(mdl.sum(mdl.sum(A[i, j, k.index] for k in Teachers[i].courses if k.year == 2)for i in range(len(Teachers))) <= 1)
     mdl.add_constraint(mdl.sum(mdl.sum(A[i, j, k.index] for k in Teachers[i].courses if k.year == 3)for i in range(len(Teachers))) <= 1)
 
+for i in range(len(Teachers)):
+    for d in range(5):
+        for k in Teachers[i].courses:
+            mdl.add_constraint(mdl.sum(A[i, (d*10+h), k.index]+A[i, (d*10+h+1), k.index] for h in range(9)) <= 2);
+
+
 solution = mdl.solve(log_output=True)
-print("sol == ")
-print(solution)
+sol = [a for a in X if A[a].solution_value == 1.0]
+print(sol)
+Keywords.createExelTableForStudents(Courses, Teachers, sol)
+Keywords.createExelTableForteachers(Courses, Teachers, sol)

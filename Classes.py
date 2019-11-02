@@ -23,4 +23,3 @@ class Course:
         self.year = int(year)
         self.hoursPerWeek = float(hoursPerWeek)
         Course.index = Course.index + 1
-
